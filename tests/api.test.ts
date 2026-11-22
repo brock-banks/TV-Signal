@@ -1,0 +1,53 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import sharp from 'sharp';
+import {createApp} from '../server/app.ts';
+test('full local API: setup security, pairing, assignments, formats, variants, ranges, revocation, persistence',async()=>{
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'signage-test-'));const service=createApp({dataDir:dir});const server=service.app.listen(0,'127.0.0.1');await new Promise<void>(r=>server.once('listening',r));const port=(server.address() as any).port,base='http://127.0.0.1:'+port;let cookie='';
+ async function req(url:string,method='GET',body?:any,headers:Record<string,string>={}){return fetch(base+url,{method,headers:{'X-Signage-Request':'1','Content-Type':'application/json',...(cookie?{Cookie:cookie}:{}),...headers},body:body?JSON.stringify(body):undefined});}
+ try{
+  assert.equal((await req('/api/admin/state')).status,401);
+  assert.equal((await req('/api/setup','POST',{password:'a-long-password-123'},{Origin:'http://evil.invalid'})).status,403);
+  assert.equal((await fetch(base+'/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"password":"a-long-password-123"}'})).status,403);
+  assert.equal((await req('/api/setup','POST',{password:'a-long-password-123'})).status,200);
+  assert.equal((await req('/api/setup','POST',{password:'second-password-123'})).status,409);
+  assert.equal((await req('/api/login','POST',{password:'wrong'})).status,401);
+  const login=await req('/api/login','POST',{password:'a-long-password-123'});assert.equal(login.status,200);cookie=login.headers.get('set-cookie')!.split(';')[0];
+  let state=await (await req('/api/admin/state')).json();assert.equal(state.screens.length,3);
+  const p=await (await req('/api/admin/playlists','POST',{name:'Morning'})).json();
+  const config=state.screens[0].config;
+  assert.equal((await req('/api/admin/screens/1','PUT',{name:'Lobby',playlistId:'missing',config})).status,400);
+  assert.equal((await req('/api/admin/screens/1','PUT',{name:'Lobby',playlistId:p.id,config:{...config,rotation:45}})).status,400);
+  assert.equal((await req('/api/admin/screens/1','PUT',{name:'Lobby',playlistId:p.id,config:{...config,width:640,height:360,rotation:90},immediate:false})).status,200);
+  assert.equal((await req('/api/admin/playlists/'+p.id,'DELETE')).status,409);
+  const pair=await (await req('/api/admin/screens/1/pair','POST')).json();
+  assert.equal((await req('/api/screens/1/pair','POST',{code:'wrong'})).status,403);
+  const enrollment=await (await req('/api/screens/1/pair','POST',{code:pair.code})).json();assert.ok(enrollment.token);
+  assert.equal((await req('/api/screens/1/pair','POST',{code:pair.code})).status,403);
+  assert.equal((await req('/api/screens/2/manifest','GET',undefined,{'X-Screen-Token':enrollment.token})).status,401);
+  const adminCookie=cookie;cookie='';assert.equal((await req('/api/admin/screens/1/commands','POST',{action:'next'},{'X-Screen-Token':enrollment.token})).status,401);cookie=adminCookie;
+  const png=await sharp({create:{width:80,height:120,channels:3,background:'#aabbcc'}}).png().toBuffer();
+  const form=new FormData();form.append('files',new Blob([new Uint8Array(png)]),'portrait.png');form.append('files',new Blob(['<script>bad</script>']),'fake.mp4');
+  const uploaded=await (await fetch(base+'/api/admin/media',{method:'POST',headers:{Cookie:cookie,'X-Signage-Request':'1'},body:form})).json();assert.equal(uploaded.results[0].status,'processing');assert.ok(uploaded.results[1].error);const mediaId=uploaded.results[0].id;
+  for(let n=0;n<100;n++){state=await (await req('/api/admin/state')).json();if(state.media[0].status!=='processing')break;await new Promise(r=>setTimeout(r,100));}assert.equal(state.media[0].status,'ready');
+  assert.equal((await req('/api/admin/media/'+mediaId+'/preview')).status,200);
+  const previewCookie=cookie;cookie='';assert.equal((await req('/api/admin/media/'+mediaId+'/preview')).status,401);cookie=previewCookie;
+  assert.equal((await req('/api/screens/1/heartbeat','POST',{currentMedia:mediaId,state:'paused',muted:true},{'X-Screen-Token':enrollment.token})).status,200);
+  state=await (await req('/api/admin/state')).json();assert.equal(state.screens[0].diagnostics.muted,true);
+  assert.equal((await req('/api/admin/playlists/'+p.id,'PUT',{name:'Morning',entries:[{mediaId,duration:7},{mediaId,duration:12}],immediate:true})).status,200);
+  let manifest:any;for(let n=0;n<100;n++){manifest=await (await req('/api/screens/1/manifest','GET',undefined,{'X-Screen-Token':enrollment.token})).json();if(manifest.items.length===2)break;await new Promise(r=>setTimeout(r,100));}assert.equal(manifest.items.length,2);assert.equal(manifest.items[0].duration,7);assert.equal(manifest.items[1].duration,12);
+  const url='/api/screens/1/media/'+manifest.items[0].file+'?token='+enrollment.token;
+  const range=await req(url,'GET',undefined,{Range:'bytes=0-99'});assert.equal(range.status,206);assert.equal((await range.arrayBuffer()).byteLength,100);
+  assert.equal((await req('/api/screens/1/media/'+manifest.items[0].file)).status,401);
+  assert.equal((await req('/api/admin/media/'+mediaId,'DELETE')).status,409);
+  const command=await (await req('/api/admin/screens/1/commands','POST',{action:'pause'})).json();
+  let beat=await (await req('/api/screens/1/heartbeat','POST',{currentMedia:mediaId,state:'playing'},{'X-Screen-Token':enrollment.token})).json();assert.equal(beat.commands[0].id,command.id);
+  await req('/api/screens/1/heartbeat','POST',{ack:[{id:command.id,ok:true,message:'Paused'}]},{'X-Screen-Token':enrollment.token});state=await (await req('/api/admin/state')).json();assert.equal(state.screens[0].commands[0].status,'success');assert.equal(state.screens[0].online,true);
+  assert.equal((await req('/api/admin/screens/1/revoke','POST')).status,200);assert.equal((await req('/api/screens/1/manifest','GET',undefined,{'X-Screen-Token':enrollment.token})).status,401);
+  const persisted=service.db.prepare('SELECT playlist_id,name FROM screens WHERE id=1').get() as any;assert.equal(persisted.playlist_id,p.id);assert.equal(persisted.name,'Lobby');
+ }finally{await new Promise<void>(r=>server.close(()=>r()));service.close();}
+ const reopened=createApp({dataDir:dir});assert.equal((reopened.db.prepare('SELECT name FROM screens WHERE id=1').get() as any).name,'Lobby');assert.equal((reopened.db.prepare('SELECT count(*) as n FROM entries').get() as any).n,2);reopened.close();await fs.rm(dir,{recursive:true,force:true,maxRetries:5,retryDelay:200});
+});

@@ -1,0 +1,10 @@
+import { DatabaseSync } from 'node:sqlite';
+import path from 'node:path';
+import readline from 'node:readline/promises';
+import fs from 'node:fs';
+if(fs.existsSync('.env'))process.loadEnvFile('.env');
+const prompt=readline.createInterface({input:process.stdin,output:process.stdout});
+const answer=await prompt.question('Stop the server and back up data first. Type RESET to remove the administrator and sessions: ');prompt.close();
+if(answer!=='RESET')process.exit(1);
+const db=new DatabaseSync(path.resolve(process.env.DATA_DIR||'data','signage.sqlite'));
+db.exec('BEGIN; DELETE FROM admin; DELETE FROM sessions; COMMIT;');db.close();console.log('Start the server and create a new administrator on localhost.');
